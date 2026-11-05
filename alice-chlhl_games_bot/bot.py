@@ -232,19 +232,22 @@ def make_dispatcher() -> Dispatcher:
     @dp.callback_query(F.data.regexp(r"^(updiv|pastdiv):(\d+)(?::(\d+))?$"))
     async def cb_division_games(cb: CallbackQuery):
         parts = _parts(cb.data)
-        mode, tid = parts[0], int(parts[1])
+        mode = "up" if parts[0].startswith("up") else "past"
+        tid = int(parts[1])
         off = int(parts[2]) if len(parts) > 2 else 0
         await show_division_games(cb, mode, tid, off)
 
     @dp.callback_query(F.data.regexp(r"^(upteams|pastteams):(\d+)$"))
     async def cb_division_teams(cb: CallbackQuery):
-        mode, tid, _ = _parts(cb.data)
-        await show_division_teams(cb, mode, int(tid))
+        parts = _parts(cb.data)
+        mode = "up" if parts[0].startswith("up") else "past"
+        await show_division_teams(cb, mode, int(parts[1]))
 
     @dp.callback_query(F.data.regexp(r"^(upteam|pastteam):(\d+):(\d+)(?::(\d+))?$"))
     async def cb_team_games(cb: CallbackQuery):
         parts = _parts(cb.data)
-        mode, tid, team_id = parts[0], int(parts[1]), int(parts[2])
+        mode = "up" if parts[0].startswith("up") else "past"
+        tid, team_id = int(parts[1]), int(parts[2])
         off = int(parts[3]) if len(parts) > 3 else 0
         await show_team_games(cb, mode, tid, team_id, off)
 
