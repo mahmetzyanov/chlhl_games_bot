@@ -220,8 +220,10 @@ def make_dispatcher() -> Dispatcher:
 
     @dp.callback_query(F.data.regexp(r"^(updiv|pastdiv):(\d+)(?::(\d+))?$"))
     async def cb_division_games(cb: CallbackQuery):
-        mode, tid, off = _parts(cb.data)
-        await show_division_games(cb, mode, int(tid), int(off or 0))
+        parts = _parts(cb.data)
+        mode, tid = parts[0], int(parts[1])
+        off = int(parts[2]) if len(parts) > 2 else 0
+        await show_division_games(cb, mode, tid, off)
 
     @dp.callback_query(F.data.regexp(r"^(upteams|pastteams):(\d+)$"))
     async def cb_division_teams(cb: CallbackQuery):
@@ -230,8 +232,10 @@ def make_dispatcher() -> Dispatcher:
 
     @dp.callback_query(F.data.regexp(r"^(upteam|pastteam):(\d+):(\d+)(?::(\d+))?$"))
     async def cb_team_games(cb: CallbackQuery):
-        mode, a, b, off = _parts(cb.data)
-        await show_team_games(cb, mode, int(a), int(b), int(off or 0))
+        parts = _parts(cb.data)
+        mode, tid, team_id = parts[0], int(parts[1]), int(parts[2])
+        off = int(parts[3]) if len(parts) > 3 else 0
+        await show_team_games(cb, mode, tid, team_id, off)
 
     # ------------------------------------------------------------- подписки
 
