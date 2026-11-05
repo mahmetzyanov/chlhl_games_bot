@@ -208,10 +208,11 @@ async def scheduler_loop(bot: Bot) -> None:
 # ------------------------------------------------------------------ учёт активности
 
 class ActivityMiddleware(BaseMiddleware):
-    """Записывает в БД и users.log каждое сообщение/нажатие кнопки.
+    """Поддерживает карточку пользователя: открытые данные, первый/последний визит.
 
-    Открытые данные из Telegram: id, @username, имя/фамилия, язык,
-    премиум-статус; при первом появлении — bio профиля и название чата.
+    При первом общении сохраняется bio профиля (если Telegram его отдаёт).
+    Отдельные запросы в БД не дописываются — таблица users обновляется,
+    а не растёт.
     """
 
     def __init__(self, db_path: str):
@@ -221,17 +222,11 @@ class ActivityMiddleware(BaseMiddleware):
         try:
             if isinstance(event, Message):
                 user, chat = event.from_user, event.chat
-                text = (event.text or "").strip()
-                action = "команда" if text.startswith("/") else "сообщение"
-                details = text
             elif isinstance(event, CallbackQuery):
                 user = event.from_user
                 chat = event.message.chat if event.message else None
-                action = "кнопка"
-                details = event.data or ""
             else:
                 user, chat = None, None
-                action, details = "", ""
             if user is not None and not user.is_bot:
                 conn = db.connect(self.db_path)
                 first_seen = db.upsert_user(
@@ -239,8 +234,8 @@ class ActivityMiddleware(BaseMiddleware):
                     chat.id if chat else None,
                     getattr(chat, "title", None) if chat else None,
                 )
-                db.log_event(conn, user.id, action, details)
-                user_log.info("%s | %s | %s", who(user), action, details)
+                if first_seen:
+                    user_log.info("%s | первое подключение", who(user))
                 if first_seen and data.get("bot"):
                     try:
                         info = await data["bot"].get_chat(user.id)
@@ -352,8 +347,8 @@ def make_dispatcher() -> Dispatcher:
         div = db.get_division(conn, tid)
         if div:
             if db.has_subscription(conn, cb.from_user.id, "division", tid):
-                db.remove_subscription(conn, cb.from_user.id, "division", tid)
-                _log_subscription(cb, "unsubscribe", f"дивизион {div['name']} (id={tid})")
+                if db.remove_subscription(conn, cb.from_user.id, "division", tid):
+                    _log_subscription(cb, "unsubscribe", f"дивизион {div['name']} (id={tid})")
             else:
                 db.add_subscription(conn, cb.from_user.id, cb.message.chat.id, "division", tid, div["name"])
                 _log_subscription(cb, "subscribe", f"дивизион {div['name']} (id={tid})")
@@ -375,8 +370,8 @@ def make_dispatcher() -> Dispatcher:
         if team:
             title = f"{team['name']} ({db.get_division(conn, int(tid))['name']})"
             if db.has_subscription(conn, cb.from_user.id, "team", int(team_id)):
-                db.remove_subscription(conn, cb.from_user.id, "team", int(team_id))
-                _log_subscription(cb, "unsubscribe", f"команда {title} (id={team_id})")
+                if db.remove_subscription(conn, cb.from_user.id, "team", int(team_id)):
+                    _log_subscription(cb, "unsubscribe", f"команда {title} (id={team_id})")
             else:
                 db.add_subscription(
                     conn, cb.from_user.id, cb.message.chat.id, "team", int(team_id), title
@@ -395,13 +390,35 @@ def make_dispatcher() -> Dispatcher:
             )
         else:
             rows_kb = [
-                [btn(f"🗑 {r['title']}", f"unsub:{r['kind']}:{r['ref_id']}")] for r in rows
+                [btn(f"🗑 {r['title']} · с {(r['subscribed_at'] or '?')[:10]}",
+                     f"unsub:{r['kind']}:{r['ref_id']}")] for r in rows
             ]
+            rows_kb.append([btn("📜 История отписок", "subhist")])
             rows_kb.append([btn("◀️ Назад", "subs")])
             await safe_edit(cb.message,
                 "Ваши подписки (нажмите, чтобы отписаться):",
                 reply_markup=kb(*rows_kb),
             )
+        await cb.answer()
+
+    @dp.callback_query(F.data == "subhist")
+    async def cb_subhist(cb: CallbackQuery):
+        conn = db.connect(config.DB_PATH)
+        rows = [r for r in db.subscription_history(conn, cb.from_user.id) if not r["active"]]
+        if not rows:
+            text = "Отписок ещё не было."
+        else:
+            lines = []
+            for r in rows:
+                label = "дивизион" if r["kind"] == "division" else "команда"
+                d1 = (r["subscribed_at"] or "?")[:10]
+                d2 = (r["unsubscribed_at"] or "?")[:10]
+                lines.append(f"🗑 {label} «{esc(r['title'])}»: с {d1} по {d2}")
+            text = "История подписок:\n\n" + "\n".join(lines)
+        await safe_edit(cb.message, text, reply_markup=kb(
+            [btn("◀️ Мои подписки", "submy")],
+            [btn("🏠 Главное меню", "menu")],
+        ))
         await cb.answer()
 
     @dp.callback_query(F.data.regexp(r"^unsub:(division|team):(\d+)$"))
@@ -412,8 +429,7 @@ def make_dispatcher() -> Dispatcher:
             "SELECT title FROM subscriptions WHERE user_id=? AND kind=? AND ref_id=?",
             (cb.from_user.id, kind, int(ref)),
         ).fetchone()
-        db.remove_subscription(conn, cb.from_user.id, kind, int(ref))
-        if row:
+        if row and db.remove_subscription(conn, cb.from_user.id, kind, int(ref)):
             label = "дивизион" if kind == "division" else "команда"
             _log_subscription(cb, "unsubscribe", f"{label} {row['title']} (id={ref})")
         await cb_sub_my(cb)
@@ -422,10 +438,8 @@ def make_dispatcher() -> Dispatcher:
 
 
 def _log_subscription(cb: CallbackQuery, action: str, details: str) -> None:
-    """Логирует подписку/отписку в БД и в users.log."""
+    """Логирует подписку/отписку в users.log (в БД — время в таблице подписок)."""
     try:
-        conn = db.connect(config.DB_PATH)
-        db.log_event(conn, cb.from_user.id, action, details)
         user_log.info("%s | %s | %s", who(cb.from_user), action, details)
     except Exception:
         log.exception("Не удалось записать событие подписки в лог")

@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     kind     TEXT NOT NULL CHECK (kind IN ('division', 'team')),
     ref_id   INTEGER NOT NULL,
     title    TEXT NOT NULL,
+    active   INTEGER NOT NULL DEFAULT 1,
+    subscribed_at   TEXT,
+    unsubscribed_at TEXT,
     PRIMARY KEY (user_id, kind, ref_id)
 );
 
@@ -94,15 +97,6 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen    TEXT,
     last_seen     TEXT
 );
-
-CREATE TABLE IF NOT EXISTS user_events (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts      TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    action  TEXT NOT NULL,
-    details TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_events_user ON user_events(user_id, ts);
 """
 
 
@@ -111,7 +105,13 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
-    conn.commit()
+    # Миграция старых баз: новые колонки таблицы подписок
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(subscriptions)")}
+    if "active" not in cols:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN subscribed_at TEXT")
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN unsubscribed_at TEXT")
+        conn.commit()
     return conn
 
 
@@ -303,38 +303,49 @@ def past_by_team(conn, team_id: int, limit: int = 10, offset: int = 0) -> list:
 # ---------------------------------------------------------------- подписки
 
 def add_subscription(conn, user_id: int, chat_id: int, kind: str, ref_id: int, title: str) -> bool:
+    """Подписывает (или возобновляет подписку). Возвращает True, если подписка активна."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute(
+        """INSERT INTO subscriptions(user_id, chat_id, kind, ref_id, title, active, subscribed_at, unsubscribed_at)
+           VALUES(?,?,?,?,?,1,?,NULL)
+           ON CONFLICT(user_id, kind, ref_id) DO UPDATE SET
+             active=1, chat_id=excluded.chat_id, title=excluded.title,
+             subscribed_at=excluded.subscribed_at, unsubscribed_at=NULL""",
+        (user_id, chat_id, kind, ref_id, title, now),
+    )
+    conn.commit()
+    return True
+
+
+def remove_subscription(conn, user_id: int, kind: str, ref_id: int) -> bool:
+    """Помечает подписку отпиской (не удаляет). Возвращает True, если была активной."""
     cur = conn.execute(
-        "INSERT OR IGNORE INTO subscriptions(user_id, chat_id, kind, ref_id, title) VALUES(?,?,?,?,?)",
-        (user_id, chat_id, kind, ref_id, title),
+        """UPDATE subscriptions SET active=0, unsubscribed_at=?
+           WHERE user_id=? AND kind=? AND ref_id=? AND active=1""",
+        (datetime.now().isoformat(timespec="seconds"), user_id, kind, ref_id),
     )
     conn.commit()
     return cur.rowcount > 0
 
 
-def remove_subscription(conn, user_id: int, kind: str, ref_id: int) -> None:
-    conn.execute(
-        "DELETE FROM subscriptions WHERE user_id=? AND kind=? AND ref_id=?",
-        (user_id, kind, ref_id),
-    )
-    conn.commit()
-
-
 def has_subscription(conn, user_id: int, kind: str, ref_id: int) -> bool:
     return conn.execute(
-        "SELECT 1 FROM subscriptions WHERE user_id=? AND kind=? AND ref_id=?",
+        "SELECT 1 FROM subscriptions WHERE user_id=? AND kind=? AND ref_id=? AND active=1",
         (user_id, kind, ref_id),
     ).fetchone() is not None
 
 
-def user_subscriptions(conn, user_id: int) -> list:
-    return conn.execute(
-        "SELECT * FROM subscriptions WHERE user_id=? ORDER BY kind, title", (user_id,)
-    ).fetchall()
+def user_subscriptions(conn, user_id: int, only_active: bool = True) -> list:
+    query = "SELECT * FROM subscriptions WHERE user_id=?"
+    if only_active:
+        query += " AND active=1"
+    return conn.execute(query + " ORDER BY kind, title", (user_id,)).fetchall()
 
 
 def chat_subscriptions(conn, chat_id: int) -> list:
     return conn.execute(
-        "SELECT * FROM subscriptions WHERE chat_id=? ORDER BY kind, title", (chat_id,)
+        "SELECT * FROM subscriptions WHERE chat_id=? AND active=1 ORDER BY kind, title",
+        (chat_id,),
     ).fetchall()
 
 
@@ -399,8 +410,9 @@ def get_users(conn: sqlite3.Connection) -> list:
     return conn.execute("SELECT * FROM users ORDER BY last_seen DESC").fetchall()
 
 
-def get_user_events(conn: sqlite3.Connection, user_id: int, limit: int = 50) -> list:
+def subscription_history(conn: sqlite3.Connection, user_id: int) -> list:
+    """Все подписки пользователя, включая отписанные (для истории)."""
     return conn.execute(
-        "SELECT * FROM user_events WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
+        "SELECT * FROM subscriptions WHERE user_id=? ORDER BY subscribed_at DESC",
+        (user_id,),
     ).fetchall()
