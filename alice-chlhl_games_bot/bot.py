@@ -17,6 +17,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -50,6 +51,16 @@ HELP_TEXT = (
 
 def esc(s) -> str:
     return html.escape(str(s or ""))
+
+
+async def safe_edit(message, text, reply_markup=None):
+    """Правит сообщение, игнорируя ошибку Telegram 'message is not modified'."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
+        raise
 
 
 def fmt_date(iso: str) -> str:
@@ -193,12 +204,12 @@ def make_dispatcher() -> Dispatcher:
 
     @dp.callback_query(F.data == "menu")
     async def cb_menu(cb: CallbackQuery):
-        await cb.message.edit_text(HELP_TEXT, reply_markup=main_menu())
+        await safe_edit(cb.message, HELP_TEXT, reply_markup=main_menu())
         await cb.answer()
 
     @dp.callback_query(F.data == "help")
     async def cb_help(cb: CallbackQuery):
-        await cb.message.edit_text(HELP_TEXT, reply_markup=main_menu())
+        await safe_edit(cb.message, HELP_TEXT, reply_markup=main_menu())
         await cb.answer()
 
     @dp.callback_query(F.data == "refresh")
@@ -212,7 +223,7 @@ def make_dispatcher() -> Dispatcher:
     @dp.callback_query(F.data.in_({"up", "past"}))
     async def cb_browse(cb: CallbackQuery):
         mode = cb.data
-        await cb.message.edit_text(
+        await safe_edit(cb.message,
             "Выберите дивизион:",
             reply_markup=divisions_kb(mode),
         )
@@ -241,18 +252,18 @@ def make_dispatcher() -> Dispatcher:
 
     @dp.callback_query(F.data == "subs")
     async def cb_subs(cb: CallbackQuery):
-        await cb.message.edit_text("🔔 Ваши подписки", reply_markup=subs_menu_kb())
+        await safe_edit(cb.message, "🔔 Ваши подписки", reply_markup=subs_menu_kb())
         await cb.answer()
 
     @dp.callback_query(F.data.in_({"subd", "subt"}))
     async def cb_sub_kind(cb: CallbackQuery):
         if cb.data == "subd":
-            await cb.message.edit_text(
+            await safe_edit(cb.message,
                 "Выберите дивизионы для подписки (можно несколько):",
                 reply_markup=sub_divisions_kb(cb.from_user.id),
             )
         else:
-            await cb.message.edit_text(
+            await safe_edit(cb.message,
                 "Сначала выберите дивизион команды:",
                 reply_markup=sub_divisions_kb(cb.from_user.id, for_teams=True),
             )
@@ -299,7 +310,7 @@ def make_dispatcher() -> Dispatcher:
         conn = db.connect(config.DB_PATH)
         rows = db.user_subscriptions(conn, cb.from_user.id)
         if not rows:
-            await cb.message.edit_text(
+            await safe_edit(cb.message,
                 "У вас пока нет подписок.", reply_markup=subs_menu_kb()
             )
         else:
@@ -307,7 +318,7 @@ def make_dispatcher() -> Dispatcher:
                 [btn(f"🗑 {r['title']}", f"unsub:{r['kind']}:{r['ref_id']}")] for r in rows
             ]
             rows_kb.append([btn("◀️ Назад", "subs")])
-            await cb.message.edit_text(
+            await safe_edit(cb.message,
                 "Ваши подписки (нажмите, чтобы отписаться):",
                 reply_markup=kb(*rows_kb),
             )
@@ -377,7 +388,7 @@ async def show_division_games(cb: CallbackQuery, mode: str, tid: int, offset: in
         [btn("◀️ Другой дивизион", mode)],
         [btn("🏠 Главное меню", "menu")],
     )
-    await cb.message.edit_text(text, reply_markup=keyboard)
+    await safe_edit(cb.message, text, reply_markup=keyboard)
     await cb.answer()
 
 
@@ -388,7 +399,7 @@ async def show_division_teams(cb: CallbackQuery, mode: str, tid: int):
     rows = [[btn(t["name"], f"{mode}team:{tid}:{t['team_id']}")] for t in teams]
     rows.append([btn("◀️ К играм дивизиона", f"{mode}div:{tid}")])
     rows.append([btn("◀️ Другой дивизион", mode)])
-    await cb.message.edit_text(
+    await safe_edit(cb.message,
         f"Команды дивизиона «{esc(div['name'] if div else '')}»: выберите команду",
         reply_markup=kb(*rows),
     )
@@ -431,7 +442,7 @@ async def show_team_games(cb: CallbackQuery, mode: str, tid: int, team_id: int, 
          btn("◀️ Другой дивизион", mode)],
         [btn("🏠 Главное меню", "menu")],
     )
-    await cb.message.edit_text(text, reply_markup=keyboard)
+    await safe_edit(cb.message, text, reply_markup=keyboard)
     await cb.answer()
 
 
@@ -471,7 +482,7 @@ async def show_sub_teams(cb: CallbackQuery, tid: int):
         rows.append([btn(label, f"subt:{tid}:{t['team_id']}")])
     rows.append([btn("◀️ Другой дивизион", "subt")])
     rows.append([btn("✅ Готово", "subs"), btn("📋 Мои подписки", "submy")])
-    await cb.message.edit_text(
+    await safe_edit(cb.message,
         f"Команды дивизиона «{esc(div['name'] if div else '')}» — выберите для подписки (можно несколько):",
         reply_markup=kb(*rows),
     )
