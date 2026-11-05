@@ -79,6 +79,30 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     title    TEXT NOT NULL,
     PRIMARY KEY (user_id, kind, ref_id)
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id       INTEGER PRIMARY KEY,
+    username      TEXT,
+    first_name    TEXT,
+    last_name     TEXT,
+    language_code TEXT,
+    is_bot        INTEGER,
+    is_premium    INTEGER,
+    bio           TEXT,
+    chat_id       INTEGER,
+    chat_title    TEXT,
+    first_seen    TEXT,
+    last_seen     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS user_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    action  TEXT NOT NULL,
+    details TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_user ON user_events(user_id, ts);
 """
 
 
@@ -320,3 +344,63 @@ def match_touches_subscription(m: Match, kind: str, ref_id: int) -> bool:
     if kind == "team":
         return ref_id in (m.home_team_id, m.away_team_id)
     return False
+
+
+# ------------------------------------------------------------ пользователи и лог
+
+def upsert_user(conn: sqlite3.Connection, from_user, chat_id=None, chat_title=None) -> bool:
+    """Сохраняет/обновляет карточку пользователя. Возвращает True при первом появлении."""
+    now = datetime.now().isoformat(timespec="seconds")
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE user_id=?", (from_user.id,)
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            """INSERT INTO users(user_id, username, first_name, last_name, language_code,
+               is_bot, is_premium, chat_id, chat_title, first_seen, last_seen)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                from_user.id, from_user.username, from_user.first_name, from_user.last_name,
+                from_user.language_code, int(from_user.is_bot),
+                int(bool(getattr(from_user, "is_premium", False))),
+                chat_id, chat_title, now, now,
+            ),
+        )
+        conn.commit()
+        return True
+    conn.execute(
+        """UPDATE users SET username=?, first_name=?, last_name=?, language_code=?,
+           is_premium=?, chat_id=COALESCE(?, chat_id), chat_title=COALESCE(?, chat_title),
+           last_seen=? WHERE user_id=?""",
+        (
+            from_user.username, from_user.first_name, from_user.last_name,
+            from_user.language_code, int(bool(getattr(from_user, "is_premium", False))),
+            chat_id, chat_title, now, from_user.id,
+        ),
+    )
+    conn.commit()
+    return False
+
+
+def update_user_bio(conn: sqlite3.Connection, user_id: int, bio: str) -> None:
+    conn.execute("UPDATE users SET bio=? WHERE user_id=?", (bio, user_id))
+    conn.commit()
+
+
+def log_event(conn: sqlite3.Connection, user_id: int, action: str, details: str = "") -> None:
+    conn.execute(
+        "INSERT INTO user_events(ts, user_id, action, details) VALUES(?,?,?,?)",
+        (datetime.now().isoformat(timespec="seconds"), user_id, action, details),
+    )
+    conn.commit()
+
+
+def get_users(conn: sqlite3.Connection) -> list:
+    return conn.execute("SELECT * FROM users ORDER BY last_seen DESC").fetchall()
+
+
+def get_user_events(conn: sqlite3.Connection, user_id: int, limit: int = 50) -> list:
+    return conn.execute(
+        "SELECT * FROM user_events WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()

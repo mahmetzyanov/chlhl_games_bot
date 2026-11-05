@@ -16,7 +16,7 @@ import html
 import logging
 from datetime import date, datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -32,6 +32,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("chlhl-bot")
+
+# Отдельный лог действий пользователей -> users.log
+user_log = logging.getLogger("chlhl.users")
+_user_file = logging.FileHandler("users.log", encoding="utf-8")
+_user_file.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+user_log.addHandler(_user_file)
+user_log.setLevel(logging.INFO)
+user_log.propagate = False
 
 WD = {0: "пн", 1: "вт", 2: "ср", 3: "чт", 4: "пт", 5: "сб", 6: "вс"}
 
@@ -51,6 +59,21 @@ HELP_TEXT = (
 
 def esc(s) -> str:
     return html.escape(str(s or ""))
+
+
+def who(user) -> str:
+    """Компактная карточка пользователя для лога: id, @username, имя."""
+    parts = [f"id={user.id}"]
+    if user.username:
+        parts.append(f"@{user.username}")
+    name = " ".join(x for x in (user.first_name, user.last_name) if x)
+    if name:
+        parts.append(name)
+    if getattr(user, "is_premium", False):
+        parts.append("premium")
+    if user.language_code:
+        parts.append(f"lang={user.language_code}")
+    return " | ".join(parts)
 
 
 async def safe_edit(message, text, reply_markup=None):
@@ -182,10 +205,60 @@ async def scheduler_loop(bot: Bot) -> None:
         await asyncio.sleep(15)
 
 
+# ------------------------------------------------------------------ учёт активности
+
+class ActivityMiddleware(BaseMiddleware):
+    """Записывает в БД и users.log каждое сообщение/нажатие кнопки.
+
+    Открытые данные из Telegram: id, @username, имя/фамилия, язык,
+    премиум-статус; при первом появлении — bio профиля и название чата.
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    async def __call__(self, handler, event, data):
+        try:
+            if isinstance(event, Message):
+                user, chat = event.from_user, event.chat
+                text = (event.text or "").strip()
+                action = "команда" if text.startswith("/") else "сообщение"
+                details = text
+            elif isinstance(event, CallbackQuery):
+                user = event.from_user
+                chat = event.message.chat if event.message else None
+                action = "кнопка"
+                details = event.data or ""
+            else:
+                user, chat = None, None
+                action, details = "", ""
+            if user is not None and not user.is_bot:
+                conn = db.connect(self.db_path)
+                first_seen = db.upsert_user(
+                    conn, user,
+                    chat.id if chat else None,
+                    getattr(chat, "title", None) if chat else None,
+                )
+                db.log_event(conn, user.id, action, details)
+                user_log.info("%s | %s | %s", who(user), action, details)
+                if first_seen and data.get("bot"):
+                    try:
+                        info = await data["bot"].get_chat(user.id)
+                        db.update_user_bio(conn, user.id, info.bio or "")
+                        user_log.info("%s | bio: %s", who(user), info.bio or "(пусто)")
+                    except Exception:
+                        pass  # bio недоступно — не критично
+        except Exception:
+            log.exception("Ошибка учёта активности (не влияет на обработку запроса)")
+        return await handler(event, data)
+
+
 # ------------------------------------------------------------------ хендлеры
 
 def make_dispatcher() -> Dispatcher:
     dp = Dispatcher()
+    dp.message.middleware(ActivityMiddleware(config.DB_PATH))
+    dp.callback_query.middleware(ActivityMiddleware(config.DB_PATH))
 
     @dp.message(CommandStart())
     @dp.message(Command("help"))
@@ -280,8 +353,10 @@ def make_dispatcher() -> Dispatcher:
         if div:
             if db.has_subscription(conn, cb.from_user.id, "division", tid):
                 db.remove_subscription(conn, cb.from_user.id, "division", tid)
+                _log_subscription(cb, "unsubscribe", f"дивизион {div['name']} (id={tid})")
             else:
                 db.add_subscription(conn, cb.from_user.id, cb.message.chat.id, "division", tid, div["name"])
+                _log_subscription(cb, "subscribe", f"дивизион {div['name']} (id={tid})")
         await cb.message.edit_reply_markup(
             reply_markup=sub_divisions_kb(cb.from_user.id)
         )
@@ -301,10 +376,12 @@ def make_dispatcher() -> Dispatcher:
             title = f"{team['name']} ({db.get_division(conn, int(tid))['name']})"
             if db.has_subscription(conn, cb.from_user.id, "team", int(team_id)):
                 db.remove_subscription(conn, cb.from_user.id, "team", int(team_id))
+                _log_subscription(cb, "unsubscribe", f"команда {title} (id={team_id})")
             else:
                 db.add_subscription(
                     conn, cb.from_user.id, cb.message.chat.id, "team", int(team_id), title
                 )
+                _log_subscription(cb, "subscribe", f"команда {title} (id={team_id})")
         await show_sub_teams(cb, int(tid))
         await cb.answer()
 
@@ -330,10 +407,28 @@ def make_dispatcher() -> Dispatcher:
     @dp.callback_query(F.data.regexp(r"^unsub:(division|team):(\d+)$"))
     async def cb_unsub(cb: CallbackQuery):
         _, kind, ref = cb.data.split(":")
-        db.remove_subscription(db.connect(config.DB_PATH), cb.from_user.id, kind, int(ref))
+        conn = db.connect(config.DB_PATH)
+        row = conn.execute(
+            "SELECT title FROM subscriptions WHERE user_id=? AND kind=? AND ref_id=?",
+            (cb.from_user.id, kind, int(ref)),
+        ).fetchone()
+        db.remove_subscription(conn, cb.from_user.id, kind, int(ref))
+        if row:
+            label = "дивизион" if kind == "division" else "команда"
+            _log_subscription(cb, "unsubscribe", f"{label} {row['title']} (id={ref})")
         await cb_sub_my(cb)
 
     return dp
+
+
+def _log_subscription(cb: CallbackQuery, action: str, details: str) -> None:
+    """Логирует подписку/отписку в БД и в users.log."""
+    try:
+        conn = db.connect(config.DB_PATH)
+        db.log_event(conn, cb.from_user.id, action, details)
+        user_log.info("%s | %s | %s", who(cb.from_user), action, details)
+    except Exception:
+        log.exception("Не удалось записать событие подписки в лог")
 
 
 def _parts(data: str) -> list:
