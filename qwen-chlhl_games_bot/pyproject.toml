@@ -1,0 +1,27 @@
+[project]
+name = "chlhl-games-bot"
+version = "0.1.0"
+description = "Telegram bot for CHLHL games"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.0",
+    "aiohttp",
+    "beautifulsoup4",
+    "lxml",
+    "python-dotenv",
+    "apscheduler",
+    "aiosqlite",
+    "sqlite-utils>=4.2.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Указываем, что исходники лежат в src/
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+# Опционально: скрипт для быстрого запуска
+[project.scripts]
+bot = "bot:main"
