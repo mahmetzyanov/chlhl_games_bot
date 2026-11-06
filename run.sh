@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 while true; do
   uv run ./alice-chlhl_games_bot/bot.py

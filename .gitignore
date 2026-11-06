@@ -18,5 +18,5 @@ wheels/
 *.db-wal
 
 # Logs
-.log
+*.log
 
