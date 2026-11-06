@@ -14,3 +14,9 @@ wheels/
 
 #Data
 *.db
+*.db-shm
+*.db-wal
+
+# Logs
+.log
+
